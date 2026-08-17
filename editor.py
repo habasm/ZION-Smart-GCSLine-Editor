@@ -1,5 +1,5 @@
 # ============================================================
-# ZION SMART GCS LINE EDITOR V4.4.1
+# ZION SMART GCS LINE EDITOR V4.6.0
 # ============================================================
 #
 # MULTI-LINE PASTE BEHAVIOR
@@ -70,6 +70,7 @@ import math
 import inspect
 import warnings
 import struct
+import time
 
 from pathlib import Path
 from datetime import datetime, timezone
@@ -117,6 +118,9 @@ LOCAL_DIR.mkdir(
     exist_ok=True
 )
 
+DOWNLOAD_DIR = LOCAL_DIR / "downloads"
+DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
 DB_FILE = (
     LOCAL_DIR /
     "editor.db"
@@ -124,7 +128,7 @@ DB_FILE = (
 
 
 print("=" * 80)
-print("ZION SMART GCS LINE EDITOR V4.4.1")
+print("ZION SMART GCS LINE EDITOR V4.6.0")
 print("=" * 80)
 
 print(
@@ -403,6 +407,12 @@ STATE = {
     "revision": 0,
     "refresh_counter": 0
 }
+
+# Avoid a remote metadata round-trip for every Next/Previous click. Source
+# generations are revalidated periodically and whenever no valid local index
+# exists.
+INDEX_VALIDATION_CACHE = {}
+INDEX_VALIDATION_TTL_SECONDS = 30.0
 
 
 # ============================================================
@@ -781,20 +791,6 @@ if not GCS_FILES:
 
 def prepare_index(filename):
 
-    blob = bucket.blob(
-        filename
-    )
-
-    blob.reload()
-
-    generation = str(
-        blob.generation
-    )
-
-    size = int(
-        blob.size or 0
-    )
-
     idx = index_path(
         filename
     )
@@ -802,6 +798,31 @@ def prepare_index(filename):
     meta = metadata_path(
         filename
     )
+
+    blob = bucket.blob(
+        filename
+    )
+
+    cached = INDEX_VALIDATION_CACHE.get(filename)
+    cache_is_current = bool(
+        cached
+        and idx.exists()
+        and meta.exists()
+        and time.monotonic() - cached["checked"] < INDEX_VALIDATION_TTL_SECONDS
+    )
+
+    if cache_is_current:
+        generation = cached["generation"]
+        size = cached["size"]
+    else:
+        blob.reload()
+        generation = str(blob.generation)
+        size = int(blob.size or 0)
+        INDEX_VALIDATION_CACHE[filename] = {
+            "generation": generation,
+            "size": size,
+            "checked": time.monotonic()
+        }
 
 
     if (
@@ -2007,6 +2028,14 @@ def render_editor(rows, filename=None):
             "No rows available."
         )
 
+    # Gradio may retain a textarea's browser value while replacing the HTML
+    # component. Mark every complete page render so the browser can apply the
+    # server-provided values once, without interfering with active typing.
+    STATE["editor_render_token"] = int(
+        STATE.get("editor_render_token") or 0
+    ) + 1
+    render_token = STATE["editor_render_token"]
+
 
     body = []
 
@@ -2073,6 +2102,7 @@ def render_editor(rows, filename=None):
                     <textarea
                         class="zion-editor"
                         data-editor
+                        data-zion-render-text="{html.escape(str(row['text']), quote=True)}"
                         spellcheck="false"
                         autocomplete="off"
                         autocorrect="off"
@@ -2157,6 +2187,8 @@ def render_editor(rows, filename=None):
         data-start="{int(STATE.get('start') or 1)}"
         data-end="{int(STATE.get('end') or 0)}"
         data-total="{int(STATE.get('current_lines') or 0)}"
+        data-page-size="{int(PAGE_SIZE)}"
+        data-render-token="{render_token}"
     >
 
         <button
@@ -2271,11 +2303,21 @@ def load_page(
             start
         )
 
+        # Use the page that was actually materialized, not only the estimated
+        # start+PAGE_SIZE boundary. Structural edits near a boundary can make
+        # a working window shorter; publishing the estimated end caused Next
+        # to skip or redundantly reload logical row numbers.
+        if rows:
+            STATE["start"] = int(rows[0]["line"])
+            STATE["end"] = int(rows[-1]["line"])
+        else:
+            STATE["end"] = max(0, start - 1)
+
 
         return (
             render_editor(rows, filename),
             page_status(filename),
-            start,
+            STATE["start"],
             total
         )
 
@@ -2307,6 +2349,38 @@ def select_file(filename, request: gr.Request):
     result = load_page(filename, start)
     save_user_progress(username, filename, result[2])
     return result
+
+
+def prepare_selected_file_download(filename, request: gr.Request):
+    """Stage one authorized source file for Gradio's browser download link."""
+    username = request_username(request)
+    require_file_access(username, filename)
+
+    if not filename:
+        raise gr.Error("Select a GCS file first.")
+
+    try:
+        destination_dir = DOWNLOAD_DIR / file_hash(filename)
+        destination_dir.mkdir(parents=True, exist_ok=True)
+        destination = destination_dir / Path(filename).name
+
+        bucket.blob(filename).download_to_filename(str(destination))
+        return (
+            gr.DownloadButton(
+                label=f"↓ Download {Path(filename).name}",
+                value=str(destination),
+                visible=True,
+                interactive=True
+            ),
+            "✅ Download is ready. Select the download link to save it to your PC."
+        )
+    except Exception as exc:
+        traceback.print_exc()
+        raise gr.Error(f"Could not prepare the download: {exc}")
+
+
+def reset_selected_file_download():
+    return gr.DownloadButton(value=None, visible=False), ""
 
 
 def _admin_notes_html(viewer_username):
@@ -2462,15 +2536,15 @@ def next_page(filename, start, request: gr.Request):
     )
 
 
-    new_start = (
-        int(start or 1)
-        + PAGE_SIZE
-    )
+    # ``jump_line`` can momentarily contain a typed row value while an edit is
+    # being saved. Navigate from the page actually on screen instead.
+    current_end = int(STATE.get("end") or 0)
+    new_start = current_end + 1 if current_end else int(start or 1) + PAGE_SIZE
 
 
     if new_start > total:
 
-        new_start = int(start or 1)
+        new_start = int(STATE.get("start") or start or 1)
 
 
     result = load_page(
@@ -2500,10 +2574,8 @@ def previous_page(filename, start, request: gr.Request):
     )
 
 
-    new_start = (
-        int(start or 1)
-        - PAGE_SIZE
-    )
+    current_start = int(STATE.get("start") or 1)
+    new_start = current_start - PAGE_SIZE
 
 
     if new_start < 1:
@@ -4043,6 +4115,40 @@ def process_editor_event(
             save_user_progress(username, filename, selected_line)
             return response("")
 
+        if event_type == "navigate":
+
+            total = int(STATE.get("current_lines") or 0)
+
+            try:
+                requested_start = max(1, int(event.get("start") or 1))
+            except (TypeError, ValueError):
+                return response("Invalid page number.")
+
+            direction = str(event.get("direction") or "")
+            try:
+                visible_boundary = int(event.get("visible_boundary") or 0)
+            except (TypeError, ValueError):
+                visible_boundary = 0
+
+            # A pending edit can leave an older page-boundary value in the
+            # browser for one render frame. For Next, the row visibly shown
+            # as the final row is authoritative: never render it again on the
+            # next page.
+            if direction == "next" and visible_boundary > 0:
+                requested_start = max(requested_start, visible_boundary + 1)
+
+            if total <= 0:
+                return response("")
+
+            # Do not reload the current page or let the page number grow past
+            # the final logical row.  The browser sends end+1 for Next.
+            if requested_start > total or requested_start == target_start:
+                return response("")
+
+            target_start = requested_start
+            save_user_progress(username, filename, target_start)
+            return response("", True)
+
         # Insert/delete/multiline paste must keep the current page anchored at
         # its existing start.  Using the clicked row as the new page start
         # made every structural action look like the surrounding rows had
@@ -5151,6 +5257,10 @@ def build_final_text_file(
 
         output_blob.reload()
 
+        # The built object is intentionally overwritten in place; force its
+        # viewer to validate the new generation on the next load.
+        INDEX_VALIDATION_CACHE.pop(output_filename, None)
+
 
         uploaded_size = int(
             output_blob.size or 0
@@ -5739,6 +5849,25 @@ CSS = r"""
     backdrop-filter: blur(10px);
 }
 
+.zion-file-selector-row {
+    align-items: end !important;
+    gap: 8px !important;
+    margin-bottom: 2px !important;
+}
+
+#zion_prepare_download_button button,
+#zion_file_download button {
+    min-height: 38px !important;
+    white-space: nowrap !important;
+}
+
+#zion_download_status {
+    min-height: 0;
+    margin: 0 0 8px;
+    font-size: 12px;
+    color: var(--body-text-color-subdued, #64748b);
+}
+
 .zion-toolbar button {
     min-width: 38px !important;
     min-height: 38px !important;
@@ -5921,6 +6050,11 @@ CSS = r"""
 .zion-row.zion-row-copied {
     background: rgba(34,197,94,.12) !important;
     box-shadow: inset 4px 0 0 #22c55e;
+}
+
+.zion-row.zion-row-selected {
+    background: rgba(245,158,11,.11) !important;
+    box-shadow: inset 4px 0 0 #f59e0b;
 }
 
 .zion-row.zion-row-pasted {
@@ -6284,52 +6418,42 @@ CSS = r"""
 
 #zion_notes_fab {
     position: fixed !important;
-    right: 22px !important;
-    bottom: 22px !important;
+    right: 16px !important;
+    bottom: 16px !important;
     z-index: 1000010 !important;
     width: auto !important;
-    min-width: 54px !important;
+    min-width: 44px !important;
 }
 
 #zion_notes_fab button {
-    min-width: 54px !important;
-    height: 54px !important;
+    min-width: 44px !important;
+    height: 44px !important;
     padding: 0 !important;
-    border-radius: 999px !important;
-    background: linear-gradient(145deg, #ffe66d, #f5ba2e) !important;
-    color: #4b3510 !important;
-    border: 1px solid #dda51e !important;
-    box-shadow: 0 12px 30px rgba(161,113,10,.32) !important;
+    border-radius: 10px !important;
+    box-shadow: 0 4px 14px rgba(15,23,42,.16) !important;
     font-weight: 800 !important;
-    font-size: 23px !important;
+    font-size: 19px !important;
 }
 
 #zion_notes_fab button:hover {
-    transform: translateY(-2px) rotate(-3deg);
-    box-shadow: 0 16px 34px rgba(161,113,10,.38) !important;
+    transform: translateY(-1px);
+    box-shadow: 0 7px 18px rgba(15,23,42,.2) !important;
 }
 
 #zion_notes_panel {
     position: fixed !important;
-    right: 22px !important;
-    bottom: 88px !important;
+    right: 16px !important;
+    bottom: 70px !important;
     z-index: 1000011 !important;
-    width: min(390px, calc(100vw - 28px)) !important;
-    max-height: min(680px, calc(100vh - 115px)) !important;
-    padding: 22px 16px 16px !important;
+    width: min(340px, calc(100vw - 24px)) !important;
+    max-height: min(520px, calc(100vh - 94px)) !important;
+    padding: 14px !important;
     overflow: auto !important;
-    border: 1px solid #e3c64f !important;
-    border-radius: 5px 5px 18px 5px !important;
-    background:
-        repeating-linear-gradient(
-            to bottom,
-            #fff8ae 0,
-            #fff8ae 31px,
-            #eadc82 32px
-        ) !important;
-    color: #443912 !important;
-    box-shadow: 5px 8px 0 rgba(156,119,23,.12),
-                0 22px 55px rgba(15,23,42,.28) !important;
+    border: 1px solid var(--block-border-color, #dfe6ee) !important;
+    border-radius: 12px !important;
+    background: var(--block-background-fill, #ffffff) !important;
+    color: var(--body-text-color, #1f2937) !important;
+    box-shadow: 0 12px 30px rgba(15,23,42,.2) !important;
     opacity: 1;
     visibility: visible;
     pointer-events: auto;
@@ -6337,18 +6461,7 @@ CSS = r"""
 }
 
 #zion_notes_panel::before {
-    content: "";
-    position: absolute;
-    top: -7px;
-    left: 50%;
-    width: 92px;
-    height: 24px;
-    transform: translateX(-50%) rotate(-2deg);
-    background: rgba(232,205,126,.72);
-    border-left: 1px solid rgba(133,103,27,.12);
-    border-right: 1px solid rgba(133,103,27,.12);
-    box-shadow: 0 2px 4px rgba(73,54,10,.09);
-    pointer-events: none;
+    display: none;
 }
 
 .zion-notes-heading {
@@ -6362,73 +6475,75 @@ CSS = r"""
 #zion_notes_panel label,
 #zion_notes_panel .prose,
 #zion_notes_panel p {
-    color: #443912 !important;
+    color: var(--body-text-color, #1f2937) !important;
 }
 
 #zion_notes_close button {
-    min-width: 34px !important;
-    width: 34px !important;
-    height: 34px !important;
+    min-width: 30px !important;
+    width: 30px !important;
+    height: 30px !important;
     padding: 0 !important;
     border-radius: 999px !important;
 }
 
 .zion-note-actions {
     align-items: end !important;
-    gap: 8px !important;
+    gap: 6px !important;
 }
 
 #zion_copy_note_button button {
-    width: 42px !important;
-    min-width: 42px !important;
-    height: 42px !important;
+    width: 36px !important;
+    min-width: 36px !important;
+    height: 36px !important;
     padding: 0 !important;
-    border-radius: 999px !important;
-    border-color: #bc8716 !important;
-    background: rgba(255,255,255,.38) !important;
-    color: #60440c !important;
-    font-size: 21px !important;
+    border-radius: 8px !important;
+    font-size: 17px !important;
 }
 
 #zion_note_text textarea {
-    min-height: 150px !important;
+    min-height: 104px !important;
     resize: vertical !important;
-    border: 1px solid rgba(125,95,20,.22) !important;
-    background: rgba(255,255,255,.34) !important;
-    color: #332a0b !important;
-    font-family: "Segoe Print", "Comic Sans MS", cursive !important;
-    font-size: 15px !important;
-    line-height: 1.72 !important;
+    border: 1px solid var(--block-border-color, #dfe6ee) !important;
+    background: var(--background-fill-secondary, #f8fafc) !important;
+    color: var(--body-text-color, #1f2937) !important;
+    font-family: inherit !important;
+    font-size: 14px !important;
+    line-height: 1.45 !important;
 }
 
-#zion_notes_panel button.primary {
-    background: #d99a18 !important;
-    border-color: #bc7f0c !important;
-    color: #fff !important;
+#zion_note_copy_status {
+    min-height: 18px;
+    margin-top: 4px;
+    font-size: 12px;
+    color: var(--body-text-color-subdued, #64748b);
+}
+
+#zion_note_copy_status.zion-copy-error {
+    color: var(--error-text-color, #b91c1c);
 }
 
 .zion-shared-notes-title {
-    margin: 12px 0 7px;
+    margin: 8px 0 5px;
     font-size: 12px;
     font-weight: 800;
-    color: #705716;
+    color: var(--body-text-color-subdued, #64748b);
     text-transform: uppercase;
     letter-spacing: .05em;
 }
 
 .zion-shared-note {
-    margin: 0 0 8px;
-    padding: 9px 10px;
-    border-left: 3px solid #d18c12;
-    border-radius: 7px;
-    background: rgba(255,255,255,.32);
+    margin: 0 0 6px;
+    padding: 7px 8px;
+    border-left: 2px solid var(--border-color-primary, #94a3b8);
+    border-radius: 6px;
+    background: var(--background-fill-secondary, #f8fafc);
 }
 
 .zion-shared-note-owner {
     margin-bottom: 4px;
     font-size: 11px;
     font-weight: 800;
-    color: #8a5b0b;
+    color: var(--body-text-color-subdued, #64748b);
 }
 
 .zion-shared-note-text {
@@ -6447,33 +6562,55 @@ CSS = r"""
 
 #zion_account_modal {
     display: none !important;
-    position: fixed !important;
-    inset: 0 !important;
-    z-index: 1000000 !important;
-    align-items: center !important;
-    justify-content: center !important;
-    padding: 18px !important;
-    background: rgba(15,23,42,.58) !important;
+}
+
+#zion_account_dialog_host {
+    display: none;
+    position: fixed;
+    inset: 0;
+    z-index: 2147483000;
+    align-items: center;
+    justify-content: center;
+    padding: 18px;
+    overflow: auto;
+    box-sizing: border-box;
+    background: rgba(15,23,42,.58);
     backdrop-filter: blur(5px);
 }
 
-#zion_account_modal.zion-open {
+#zion_account_dialog_host.zion-open {
     display: flex !important;
 }
 
-#zion_account_modal .zion-account-card {
+#zion_account_dialog_host .zion-account-card,
+#zion_account_dialog_host > * {
+    display: flex !important;
+    position: relative !important;
+    z-index: 2147483001 !important;
+    flex-direction: column !important;
+    flex: 0 1 auto !important;
     width: min(820px, 96vw) !important;
+    min-width: min(320px, calc(100vw - 36px)) !important;
     max-height: 90vh !important;
     overflow-y: auto !important;
     padding: 22px !important;
     border: 1px solid var(--block-border-color, rgba(148,163,184,.35)) !important;
     border-radius: 18px !important;
-    background: var(--body-background-fill, #fff) !important;
+    background: var(--block-background-fill, var(--body-background-fill, #ffffff)) !important;
     color: var(--body-text-color, #1f2937) !important;
+    color-scheme: light dark;
     box-shadow: 0 28px 90px rgba(15,23,42,.35) !important;
+    visibility: visible !important;
+    opacity: 1 !important;
+    transform: none !important;
+    box-sizing: border-box !important;
 }
 
-#zion_account_modal .zion-account-heading {
+body.zion-account-open {
+    overflow: hidden !important;
+}
+
+#zion_account_dialog_host .zion-account-heading {
     align-items: center !important;
     margin-bottom: 4px !important;
 }
@@ -6487,12 +6624,12 @@ CSS = r"""
     font-size: 22px !important;
 }
 
-#zion_account_modal h3 {
+#zion_account_dialog_host h3 {
     margin-top: 14px !important;
     color: var(--body-text-color, #1e3a5f);
 }
 
-#zion_account_modal .tab-nav {
+#zion_account_dialog_host .tab-nav {
     border-bottom-color: var(--block-border-color, #dfe6ee) !important;
 }
 
@@ -6737,7 +6874,7 @@ JS = r"""
     }
 
     console.log(
-        "ZION Smart Editor V4.4.1 controls loaded"
+        "ZION Smart Editor V4.6.0 controls loaded"
     );
 
     const zionTooltips = {
@@ -6757,6 +6894,99 @@ JS = r"""
         zion_copy_note_button: "Copy note text"
     };
 
+    function setAccountModalOpen(open) {
+        const modal = document.getElementById("zion_account_modal");
+        if (!modal) return;
+
+        modal.setAttribute("aria-hidden", open ? "false" : "true");
+        document.body.classList.toggle("zion-account-open", Boolean(open));
+
+        let host = document.getElementById("zion_account_dialog_host");
+        if (open) {
+            if (!host) {
+                host = document.createElement("div");
+                host.id = "zion_account_dialog_host";
+                host.setAttribute("role", "dialog");
+                host.setAttribute("aria-modal", "true");
+                document.body.appendChild(host);
+                host.addEventListener("click", event => {
+                    if (event.target === host) setAccountModalOpen(false);
+                });
+            }
+
+            // The card is the existing Gradio component tree, so its form
+            // controls and server bindings remain intact. Only its parent is
+            // changed to a native top-level dialog host.
+            const card = host.querySelector(".zion-account-card")
+                || modal.querySelector(".zion-account-card")
+                || modal.firstElementChild;
+            if (card) {
+                if (card.parentElement !== host) host.appendChild(card);
+                card.style.setProperty("display", "flex", "important");
+                card.style.setProperty("visibility", "visible", "important");
+                card.style.setProperty("opacity", "1", "important");
+                card.style.setProperty("position", "relative", "important");
+                card.style.setProperty("z-index", "2147483001", "important");
+            }
+            host.classList.add("zion-open");
+        } else {
+            if (host) host.classList.remove("zion-open");
+        }
+    }
+
+    window.__zionSetAccountModalOpen = setAccountModalOpen;
+
+    let highlightedRowId = null;
+    let highlightedRowKind = "zion-row-selected";
+    let appliedEditorRenderToken = null;
+
+    function applyFreshPageText() {
+        const editorShell = document.getElementById("zion-editor");
+        const token = editorShell && editorShell.dataset.renderToken;
+        if (!editorShell || !token || token === appliedEditorRenderToken) return;
+
+        // Apply the server value once for a newly rendered page. This avoids
+        // a browser-retained textarea value from the previous page appearing
+        // in the final row after navigation, while never resetting a user who
+        // is typing on the current page.
+        editorShell.querySelectorAll("[data-editor][data-zion-render-text]")
+            .forEach(editor => {
+                const serverText = editor.dataset.zionRenderText || "";
+                editor.value = serverText;
+                editor.defaultValue = serverText;
+            });
+        appliedEditorRenderToken = token;
+    }
+
+    function highlightRow(row, kind = "zion-row-selected") {
+        if (!row) return;
+
+        highlightedRowId = row.dataset.rowId || null;
+        highlightedRowKind = kind;
+
+        document.querySelectorAll(
+            ".zion-row-selected, .zion-row-copied, .zion-row-pasted"
+        ).forEach(candidate => {
+            candidate.classList.remove(
+                "zion-row-selected",
+                "zion-row-copied",
+                "zion-row-pasted"
+            );
+        });
+
+        row.classList.add(kind);
+    }
+
+    function restoreHighlightedRow() {
+        if (!highlightedRowId) return;
+
+        const row = Array.from(
+            document.querySelectorAll(".zion-row[data-row-id]")
+        ).find(candidate => candidate.dataset.rowId === highlightedRowId);
+
+        if (row) row.classList.add(highlightedRowKind);
+    }
+
     function refineApplicationChrome() {
         for (const [id, title] of Object.entries(zionTooltips)) {
             const wrapper = document.getElementById(id);
@@ -6771,6 +7001,10 @@ JS = r"""
                 link.style.display = "none";
             }
         });
+
+        applyFreshPageText();
+        document.querySelectorAll(".zion-row").forEach(updateWords);
+        restoreHighlightedRow();
     }
 
     function setSaveAttention(forceDirty = null) {
@@ -6924,6 +7158,30 @@ JS = r"""
 
     const pendingEditorEvents = [];
     let activeEditorEventId = null;
+    let queuedNativeNavigationButton = null;
+    let replayingNativeNavigationClick = false;
+
+    function replayQueuedNativeNavigation() {
+        if (
+            activeEditorEventId
+            || pendingEditorEvents.length
+            || !queuedNativeNavigationButton
+        ) {
+            return false;
+        }
+
+        const button = queuedNativeNavigationButton;
+        queuedNativeNavigationButton = null;
+        if (!button.isConnected || button.disabled) return true;
+
+        replayingNativeNavigationClick = true;
+        try {
+            button.click();
+        } finally {
+            replayingNativeNavigationClick = false;
+        }
+        return true;
+    }
 
     function pumpEditorEvents() {
         if (activeEditorEventId || !pendingEditorEvents.length) {
@@ -6975,6 +7233,9 @@ JS = r"""
         }
 
         activeEditorEventId = null;
+        if (replayQueuedNativeNavigation()) {
+            return;
+        }
         pumpEditorEvents();
     }
 
@@ -7096,6 +7357,13 @@ function normalizeClipboard(raw) {
         }, 950);
     }
 
+    function setNoteCopyStatus(message, isError = false) {
+        const status = document.getElementById("zion_note_copy_status");
+        if (!status) return;
+        status.textContent = message;
+        status.classList.toggle("zion-copy-error", Boolean(isError));
+    }
+
     function pasteTextIntoRow(row, raw) {
         if (!row) return false;
         const editor = row.querySelector("[data-editor]");
@@ -7125,13 +7393,10 @@ function normalizeClipboard(raw) {
 
     function markClipboardRow(row, kind) {
         if (!row) return;
-        row.classList.remove("zion-row-copied", "zion-row-pasted");
-        row.classList.add(kind === "copy" ? "zion-row-copied" : "zion-row-pasted");
-        window.setTimeout(() => {
-            if (row.isConnected) {
-                row.classList.remove("zion-row-copied", "zion-row-pasted");
-            }
-        }, 1500);
+        highlightRow(
+            row,
+            kind === "copy" ? "zion-row-copied" : "zion-row-pasted"
+        );
     }
 
     function showClipboardPasteDialog(row) {
@@ -7224,17 +7489,34 @@ function normalizeClipboard(raw) {
             "#zion_note_text textarea, #zion_note_text input"
         );
         try {
+            if (!noteBox || !noteBox.value.trim()) {
+                throw new Error("There is no note text to copy.");
+            }
             await copyTextToClipboard(noteBox ? noteBox.value : "", noteBox);
             flashClipboardButton(button, true);
+            setNoteCopyStatus("Copied to clipboard.");
         } catch (error) {
             console.error("ZION note copy failed", error);
             flashClipboardButton(button, false);
+            setNoteCopyStatus(
+                error.message || "Could not copy the note.",
+                true
+            );
         }
     }
 
     // Delegate clipboard actions from the document.  Rows are replaced after
     // every structural refresh, so direct button bindings were frequently
     // lost or were not attached yet when users clicked during a slow load.
+    document.addEventListener(
+        "pointerdown",
+        event => {
+            const row = event.target.closest(".zion-row[data-row-id]");
+            if (row) highlightRow(row);
+        },
+        true
+    );
+
     document.addEventListener(
         "click",
         event => {
@@ -7631,6 +7913,34 @@ function normalizeClipboard(raw) {
                     500
                 );
 
+        },
+        true
+    );
+
+    function flushPendingEditorEdits() {
+        document.querySelectorAll(".zion-row[data-row-id]").forEach(row => {
+            const editor = row.querySelector("[data-editor]");
+            if (!editor || !editor._zionTimer) return;
+
+            clearTimeout(editor._zionTimer);
+            editor._zionTimer = null;
+            updateWords(row);
+
+            sendEvent({
+                type: "edit",
+                row_id: row.dataset.rowId,
+                line: Number(row.dataset.line),
+                text: editor.value
+            });
+        });
+    }
+
+    document.addEventListener(
+        "keydown",
+        event => {
+            if (event.key === "Enter" && event.target.closest("[data-editor]")) {
+                event.preventDefault();
+            }
         },
         true
     );
@@ -8075,35 +8385,70 @@ function normalizeClipboard(raw) {
                 return;
             }
 
-            const pageNavigator = event.target.closest("[data-zion-nav]");
+            const pageNavigator = event.target.closest(
+                "[data-zion-nav], "
+                + "#zion_go_button button, "
+                + "#zion_previous_button button, #zion_next_button button, "
+                + "#zion_bottom_previous_button button, #zion_bottom_next_button button"
+            );
             if (pageNavigator) {
-                if (pageNavigator.disabled || pageNavigator.classList.contains("zion-nav-disabled")) {
-                    return;
+                if (replayingNativeNavigationClick) return;
+
+                const inlineDirection = pageNavigator.dataset.zionNav;
+                const nativeButton = inlineDirection
+                    ? document.querySelector(
+                        inlineDirection === "previous"
+                            ? "#zion_previous_button button"
+                            : "#zion_next_button button"
+                    )
+                    : pageNavigator;
+
+                const editorHasPendingWork = Boolean(activeEditorEventId)
+                    || pendingEditorEvents.length > 0
+                    || Array.from(
+                        document.querySelectorAll(".zion-row [data-editor]")
+                    ).some(editor => Boolean(editor._zionTimer));
+
+                // Do not let a page response race a just-edited final row.
+                // Save first, wait for its acknowledgement, then replay the
+                // same normal Gradio navigation button exactly once.
+                if (inlineDirection || editorHasPendingWork) {
+                    event.preventDefault();
+                    event.stopImmediatePropagation();
+                    queuedNativeNavigationButton = nativeButton;
+                    flushPendingEditorEdits();
+                    if (!activeEditorEventId && !pendingEditorEvents.length) {
+                        replayQueuedNativeNavigation();
+                    }
                 }
-                const target = document.querySelector(
-                    pageNavigator.dataset.zionNav === "previous"
-                        ? "#zion_previous_button button"
-                        : "#zion_next_button button"
-                );
-                if (target) target.click();
                 return;
             }
 
             if (event.target.closest("#zion_account_button")) {
                 const notesClose = document.querySelector("#zion_notes_close button");
                 if (notesPanel && notesClose) notesClose.click();
-                if (accountModal) accountModal.classList.add("zion-open");
+                setAccountModalOpen(true);
                 return;
             }
 
             if (event.target.closest("#zion_account_close")) {
-                if (accountModal) accountModal.classList.remove("zion-open");
+                setAccountModalOpen(false);
+                return;
+            }
+
+            if (accountModal && event.target === accountModal) {
+                setAccountModalOpen(false);
                 return;
             }
 
             if (event.target.closest("#zion_logout_button")) {
                 event.preventDefault();
-                window.location.assign("./logout");
+                const basePath = window.location.pathname.endsWith("/")
+                    ? window.location.pathname
+                    : window.location.pathname + "/";
+                window.location.assign(
+                    new URL(basePath + "logout", window.location.origin).href
+                );
                 return;
             }
 
@@ -8145,7 +8490,7 @@ function normalizeClipboard(raw) {
                 const accountModal = document.getElementById(
                     "zion_account_modal"
                 );
-                if (accountModal) accountModal.classList.remove("zion-open");
+                setAccountModalOpen(false);
 
                 const notesPanel = document.getElementById(
                     "zion_notes_panel"
@@ -8277,7 +8622,7 @@ if not _LAUNCH_SUPPORTS_STYLING:
 with gr.Blocks(
 
     title=
-        "ZION Smart GCS Editor V4.4.1",
+        "ZION Smart GCS Editor V4.6.0",
 
     **BLOCKS_STYLE_KWARGS
 
@@ -8290,7 +8635,7 @@ with gr.Blocks(
 
     gr.Markdown(
         """
-# ZION Smart GCS Line Editor V4.4.1
+# ZION Smart GCS Line Editor V4.6.0
 """
     )
 
@@ -8420,21 +8765,21 @@ with gr.Blocks(
 
     with gr.Group(visible=False, elem_id="zion_notes_panel") as notes_panel:
         with gr.Row(elem_classes=["zion-notes-heading"]):
-            gr.Markdown("### Sticky notes")
+            gr.Markdown("### Notes")
             notes_close_button = gr.Button(
                 "×",
                 elem_id="zion_notes_close",
                 scale=0
             )
         note_context_status = gr.Markdown(
-            "Your personal global notepad"
+            "Private note"
         )
         shared_admin_notes = gr.HTML("")
         note_text = gr.Textbox(
-            label="My sticky note",
-            placeholder="Write a reminder, editing note, or anything you want to remember...",
-            lines=7,
-            max_lines=14,
+            label="My note",
+            placeholder="Write a quick reminder…",
+            lines=5,
+            max_lines=9,
             elem_id="zion_note_text"
         )
         with gr.Row(elem_classes=["zion-note-actions"]):
@@ -8445,10 +8790,11 @@ with gr.Blocks(
                 scale=0
             )
             save_note_button = gr.Button(
-                "Save note",
+                "Save",
                 variant="primary",
                 scale=1
             )
+        note_copy_status = gr.Markdown("", elem_id="zion_note_copy_status")
         note_save_status = gr.Markdown("")
 
 
@@ -8456,18 +8802,27 @@ with gr.Blocks(
     # FILE SELECTOR
     # ========================================================
 
-    file_dropdown = gr.Dropdown(
-
-        choices=[],
-
-        value=None,
-
-        label="GCS file",
-
-        elem_id=
-            "zion_file_selector"
-
-    )
+    with gr.Row(elem_classes=["zion-file-selector-row"]):
+        prepare_download_button = gr.Button(
+            "Prepare download",
+            variant="secondary",
+            scale=0,
+            elem_id="zion_prepare_download_button"
+        )
+        file_download = gr.DownloadButton(
+            "Download file",
+            visible=False,
+            scale=0,
+            elem_id="zion_file_download"
+        )
+        file_dropdown = gr.Dropdown(
+            choices=[],
+            value=None,
+            label="GCS file",
+            scale=1,
+            elem_id="zion_file_selector"
+        )
+    download_status = gr.Markdown("", elem_id="zion_download_status")
 
 
     # ========================================================
@@ -8483,6 +8838,8 @@ with gr.Blocks(
             precision=0,
 
             label="Jump to row",
+
+            elem_id="zion_jump_line",
 
             scale=2
 
@@ -8776,6 +9133,50 @@ Repeated BUILD operations update the same output file.
     # FILE CHANGE
     # ========================================================
 
+    # Bind account controls directly through Gradio as well as the delegated
+    # page listener. This keeps the user/admin/file modal and logout working
+    # even when Gradio replaces toolbar DOM during a render.
+    account_button.click(
+        fn=None,
+        js="""() => {
+            if (window.__zionSetAccountModalOpen) {
+                window.__zionSetAccountModalOpen(true);
+                return;
+            }
+            const modal = document.getElementById('zion_account_modal');
+            if (modal) {
+                modal.classList.add('zion-open');
+                modal.style.setProperty('display', 'flex', 'important');
+                modal.style.setProperty('visibility', 'visible', 'important');
+                modal.style.setProperty('opacity', '1', 'important');
+            }
+        }"""
+    )
+
+    account_close_button.click(
+        fn=None,
+        js="""() => {
+            if (window.__zionSetAccountModalOpen) {
+                window.__zionSetAccountModalOpen(false);
+                return;
+            }
+            const modal = document.getElementById('zion_account_modal');
+            if (modal) modal.classList.remove('zion-open');
+        }"""
+    )
+
+    logout_button.click(
+        fn=None,
+        js="""() => {
+            const basePath = window.location.pathname.endsWith('/')
+                ? window.location.pathname
+                : window.location.pathname + '/';
+            window.location.assign(
+                new URL(basePath + 'logout', window.location.origin).href
+            );
+        }"""
+    )
+
     change_password_button.click(
         change_own_password,
         inputs=[current_password, new_password, confirm_password],
@@ -8905,6 +9306,13 @@ Repeated BUILD operations update the same output file.
         show_progress="minimal"
     )
 
+    prepare_download_button.click(
+        prepare_selected_file_download,
+        inputs=[file_dropdown],
+        outputs=[file_download, download_status],
+        show_progress="minimal"
+    )
+
     file_dropdown.change(
 
         select_file,
@@ -8922,6 +9330,13 @@ Repeated BUILD operations update the same output file.
 
         show_progress="minimal"
 
+    )
+
+    file_dropdown.change(
+        reset_selected_file_download,
+        inputs=[],
+        outputs=[file_download, download_status],
+        show_progress="hidden"
     )
 
 
@@ -8974,53 +9389,21 @@ Repeated BUILD operations update the same output file.
     )
 
 
-    # ========================================================
-    # GO
-    # ========================================================
-
+    # Navigation is handled by these standard Gradio callbacks. JavaScript
+    # only flushes a pending edit before the click; it does not issue a second
+    # navigation request.
     jump_button.click(
-
         refresh_current,
-
-        inputs=[
-            file_dropdown,
-            jump_line
-        ],
-
-        outputs=[
-            editor,
-            status,
-            jump_line,
-            current_total
-        ],
-
+        inputs=[file_dropdown, jump_line],
+        outputs=[editor, status, jump_line, current_total],
         show_progress="minimal"
-
     )
 
-
-    # ========================================================
-    # NEXT
-    # ========================================================
-
     next_button.click(
-
         next_page,
-
-        inputs=[
-            file_dropdown,
-            jump_line
-        ],
-
-        outputs=[
-            editor,
-            status,
-            jump_line,
-            current_total
-        ],
-
+        inputs=[file_dropdown, jump_line],
+        outputs=[editor, status, jump_line, current_total],
         show_progress="minimal"
-
     )
 
     bottom_next_button.click(
@@ -9030,29 +9413,11 @@ Repeated BUILD operations update the same output file.
         show_progress="minimal"
     )
 
-
-    # ========================================================
-    # PREVIOUS
-    # ========================================================
-
     previous_button.click(
-
         previous_page,
-
-        inputs=[
-            file_dropdown,
-            jump_line
-        ],
-
-        outputs=[
-            editor,
-            status,
-            jump_line,
-            current_total
-        ],
-
+        inputs=[file_dropdown, jump_line],
+        outputs=[editor, status, jump_line, current_total],
         show_progress="minimal"
-
     )
 
     bottom_previous_button.click(
@@ -9194,7 +9559,7 @@ Repeated BUILD operations update the same output file.
 
 print()
 print("=" * 80)
-print("ZION SMART GCS LINE EDITOR V4.4.1 READY")
+print("ZION SMART GCS LINE EDITOR V4.6.0 READY")
 print("=" * 80)
 
 print()
